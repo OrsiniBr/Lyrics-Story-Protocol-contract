@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.26;
+pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 interface ISongFactory {
-    function registerSong(address creator, uint256 songId, string calldata metadataURI) 
+    function registerSong(uint256 songId, string calldata metadataURI) 
         external returns (uint256 tokenId, address ipId);
     
     function getSong(uint256 songId) external view returns (
@@ -25,20 +25,30 @@ interface IStoryDerivative {
     ) external;
 }
 
+interface ILyricToken {
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
+}
+
 /**
  * @title DerivativeFactory
  * @notice Creates remixes/derivatives and links them to parent songs
  * Story Protocol enforces the 15% royalty automatically
+ * Users get instant LYRIC token rewards for creating derivatives!
  */
 contract DerivativeFactory is Ownable, ReentrancyGuard {
     ISongFactory public songFactory;
     IStoryDerivative public storyDerivative;
+    ILyricToken public lyricToken;
     
     address public licenseTemplate;
     uint256 public licenseTermsId;
-    address public backend;
     
     uint16 public constant ROYALTY_PERCENTAGE = 15; // 15%
+    
+    // Reward amount for creating a derivative (adjustable by owner)
+    uint256 public derivativeCreationReward = 10 * 10**18; // 10 LYRIC tokens
     
     struct Derivative {
         uint256 parentSongId;
@@ -57,21 +67,16 @@ contract DerivativeFactory is Ownable, ReentrancyGuard {
         uint256 indexed childSongId,
         address parentIpId,
         address childIpId,
-        string derivativeType
+        address creator,
+        string derivativeType,
+        uint256 rewardAmount
     );
     
-    constructor(address _songFactory, address _backend) Ownable(msg.sender) {
+    event RewardUpdated(uint256 newReward);
+    
+    constructor(address _songFactory, address _lyricToken) Ownable(msg.sender) {
         songFactory = ISongFactory(_songFactory);
-        backend = _backend;
-    }
-    
-    modifier onlyBackend() {
-        require(msg.sender == backend || msg.sender == owner(), "Not authorized");
-        _;
-    }
-    
-    function setBackend(address _backend) external onlyOwner {
-        backend = _backend;
+        lyricToken = ILyricToken(_lyricToken);
     }
     
     function initStoryProtocol(
@@ -85,30 +90,43 @@ contract DerivativeFactory is Ownable, ReentrancyGuard {
     }
     
     /**
-     * @dev Create a derivative/remix
+     * @dev Update derivative creation reward amount
+     * @param newReward New reward amount in wei
+     */
+    function updateDerivativeCreationReward(uint256 newReward) external onlyOwner {
+        require(newReward > 0 && newReward <= 50 * 10**18, "Reward must be 1-50 tokens");
+        derivativeCreationReward = newReward;
+        emit RewardUpdated(newReward);
+    }
+    
+    /**
+     * @dev Create a derivative/remix (ANYONE can call this)
      * @param parentSongId Original song ID
-     * @param childSongId New derivative song ID
-     * @param creator Remix creator's wallet
-     * @param metadataURI IPFS URI for derivative
+     * @param childSongId New derivative song ID (must be unique)
+     * @param metadataURI IPFS URI for derivative metadata
      * @param derivativeType "Spanish", "Lofi", "Remix", etc.
+     * 
+     * User gets instant LYRIC token reward!
+     * Original creator automatically gets 15% royalty via Story Protocol
      */
     function createDerivative(
         uint256 parentSongId,
         uint256 childSongId,
-        address creator,
         string calldata metadataURI,
         string calldata derivativeType
-    ) external onlyBackend nonReentrant returns (uint256 childTokenId, address childIpId) {
-        require(derivatives[childSongId].timestamp == 0, "Derivative exists");
+    ) external nonReentrant returns (uint256 childTokenId, address childIpId) {
+        require(derivatives[childSongId].timestamp == 0, "Derivative already exists");
         
-        // Get parent info
+        address creator = msg.sender;
+        
+        // 1. Get parent song info
         (,address parentIpId,,) = songFactory.getSong(parentSongId);
-        require(parentIpId != address(0), "Parent not found");
+        require(parentIpId != address(0), "Parent song not found");
         
-        // 1. Register derivative as new song
-        (childTokenId, childIpId) = songFactory.registerSong(creator, childSongId, metadataURI);
+        // 2. Register derivative as new song
+        (childTokenId, childIpId) = songFactory.registerSong(childSongId, metadataURI);
         
-        // 2. Link to parent via Story Protocol
+        // 3. Link to parent via Story Protocol
         address[] memory parents = new address[](1);
         parents[0] = parentIpId;
         
@@ -119,7 +137,7 @@ contract DerivativeFactory is Ownable, ReentrancyGuard {
             licenseTermsId
         );
         
-        // Store relationship
+        // 4. Store derivative relationship
         derivatives[childSongId] = Derivative({
             parentSongId: parentSongId,
             childSongId: childSongId,
@@ -131,16 +149,71 @@ contract DerivativeFactory is Ownable, ReentrancyGuard {
         
         childrenOf[parentSongId].push(childSongId);
         
-        emit DerivativeCreated(parentSongId, childSongId, parentIpId, childIpId, derivativeType);
+        // 5. Reward creator with LYRIC tokens
+        uint256 contractBalance = lyricToken.balanceOf(address(this));
+        if (contractBalance >= derivativeCreationReward) {
+            require(
+                lyricToken.transfer(creator, derivativeCreationReward),
+                "Reward transfer failed"
+            );
+        }
+        
+        emit DerivativeCreated(
+            parentSongId, 
+            childSongId, 
+            parentIpId, 
+            childIpId, 
+            creator,
+            derivativeType,
+            derivativeCreationReward
+        );
         
         return (childTokenId, childIpId);
     }
     
-    function getDerivative(uint256 childSongId) external view returns (Derivative memory) {
+    /**
+     * @dev Get all derivatives of a parent song
+     */
+    function getDerivatives(uint256 parentSongId) external view returns (uint256[] memory) {
+        return childrenOf[parentSongId];
+    }
+    
+    /**
+     * @dev Get derivative info
+     */
+    function getDerivativeInfo(uint256 childSongId) external view returns (Derivative memory) {
+        require(derivatives[childSongId].timestamp != 0, "Derivative not found");
         return derivatives[childSongId];
     }
     
-    function getChildren(uint256 parentSongId) external view returns (uint256[] memory) {
-        return childrenOf[parentSongId];
+    /**
+     * @dev Check if song is a derivative
+     */
+    function isDerivative(uint256 songId) external view returns (bool) {
+        return derivatives[songId].timestamp != 0;
+    }
+    
+    /**
+     * @dev Check contract's LYRIC token balance (for monitoring)
+     */
+    function getRewardBalance() external view returns (uint256) {
+        return lyricToken.balanceOf(address(this));
+    }
+    
+    /**
+     * @dev Owner can withdraw LYRIC tokens if needed
+     */
+    function withdrawTokens(uint256 amount) external onlyOwner {
+        require(lyricToken.transfer(owner(), amount), "Withdraw failed");
+    }
+    
+    /**
+     * @dev Owner can deposit LYRIC tokens to fund rewards
+     */
+    function fundRewards(uint256 amount) external {
+        require(
+            lyricToken.transferFrom(msg.sender, address(this), amount),
+            "Transfer failed"
+        );
     }
 }

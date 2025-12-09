@@ -18,21 +18,33 @@ interface ILicensing {
         external;
 }
 
+interface ILyricToken {
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
+}
+
 /**
  * @title SongFactory
- * @notice ONE-CLICK song registration:
+ * @notice ONE-CLICK song registration for Web3 dApp:
  * 1. Mint NFT
  * 2. Register with Story Protocol
  * 3. Attach license (allows derivatives with royalty)
+ * 4. Reward creator with LYRIC tokens
+ * 
+ * Users call this directly from their wallets and get instant rewards!
  */
 contract SongFactory is Ownable, ReentrancyGuard {
     ISongNFT public songNFT;
     IStoryProtocol public storyRegistry;
     ILicensing public licensing;
+    ILyricToken public lyricToken;
     
     address public licenseTemplate;
     uint256 public licenseTermsId;
-    address public backend; // Your backend wallet
+    
+    // Reward amount for creating a song (adjustable by owner)
+    uint256 public songCreationReward = 10 * 10**18; // 10 LYRIC tokens
     
     struct Song {
         uint256 tokenId;
@@ -47,21 +59,15 @@ contract SongFactory is Ownable, ReentrancyGuard {
         uint256 indexed songId,
         uint256 tokenId,
         address ipId,
-        address creator
+        address creator,
+        uint256 rewardAmount
     );
     
-    constructor(address _songNFT, address _backend) Ownable(msg.sender) {
+    event RewardUpdated(uint256 newReward);
+    
+    constructor(address _songNFT, address _lyricToken) Ownable(msg.sender) {
         songNFT = ISongNFT(_songNFT);
-        backend = _backend;
-    }
-    
-    modifier onlyBackend() {
-        require(msg.sender == backend || msg.sender == owner(), "Not authorized");
-        _;
-    }
-    
-    function setBackend(address _backend) external onlyOwner {
-        backend = _backend;
+        lyricToken = ILyricToken(_lyricToken);
     }
     
     /**
@@ -80,28 +86,40 @@ contract SongFactory is Ownable, ReentrancyGuard {
     }
     
     /**
-     * @dev Register a new song (backend calls this)
-     * @param creator User's wallet
-     * @param songId Your database ID
-     * @param metadataURI IPFS URI
+     * @dev Update song creation reward amount
+     * @param newReward New reward amount in wei (e.g., 50 * 10**18 = 50 tokens)
+     */
+    function updateSongCreationReward(uint256 newReward) external onlyOwner {
+        require(newReward > 0 && newReward <= 50 * 10**18, "Reward must be 1-50 tokens");
+        songCreationReward = newReward;
+        emit RewardUpdated(newReward);
+    }
+    
+    /**
+     * @dev Register a new song (ANYONE can call this for themselves)
+     * @param songId Unique ID for the song
+     * @param metadataURI IPFS URI with song metadata
+     * 
+     * User gets instant LYRIC token reward!
      */
     function registerSong(
-        address creator,
         uint256 songId,
         string calldata metadataURI
-    ) external onlyBackend nonReentrant returns (uint256 tokenId, address ipId) {
-        require(songs[songId].timestamp == 0, "Song exists");
+    ) external nonReentrant returns (uint256 tokenId, address ipId) {
+        require(songs[songId].timestamp == 0, "Song already registered");
         
-        // 1. Mint NFT
+        address creator = msg.sender;
+        
+        // 1. Mint NFT to caller
         tokenId = songNFT.mint(creator, songId, metadataURI);
         
         // 2. Register with Story Protocol
         ipId = storyRegistry.register(block.chainid, address(songNFT), tokenId);
         
-        // 3. Attach license
+        // 3. Attach license (allows derivatives with 15% royalty)
         licensing.attachLicenseTerms(ipId, licenseTemplate, licenseTermsId);
         
-        // Store
+        // 4. Store song data
         songs[songId] = Song({
             tokenId: tokenId,
             ipId: ipId,
@@ -109,12 +127,49 @@ contract SongFactory is Ownable, ReentrancyGuard {
             timestamp: block.timestamp
         });
         
-        emit SongRegistered(songId, tokenId, ipId, creator);
+        // 5. Reward creator with LYRIC tokens
+        uint256 contractBalance = lyricToken.balanceOf(address(this));
+        if (contractBalance >= songCreationReward) {
+            require(
+                lyricToken.transfer(creator, songCreationReward),
+                "Reward transfer failed"
+            );
+        }
+        
+        emit SongRegistered(songId, tokenId, ipId, creator, songCreationReward);
         
         return (tokenId, ipId);
     }
     
+    /**
+     * @dev Get song details
+     */
     function getSong(uint256 songId) external view returns (Song memory) {
+        require(songs[songId].timestamp != 0, "Song not found");
         return songs[songId];
+    }
+    
+    /**
+     * @dev Check contract's LYRIC token balance (for monitoring)
+     */
+    function getRewardBalance() external view returns (uint256) {
+        return lyricToken.balanceOf(address(this));
+    }
+    
+    /**
+     * @dev Owner can withdraw LYRIC tokens if needed
+     */
+    function withdrawTokens(uint256 amount) external onlyOwner {
+        require(lyricToken.transfer(owner(), amount), "Withdraw failed");
+    }
+    
+    /**
+     * @dev Owner can deposit LYRIC tokens to fund rewards
+     */
+    function fundRewards(uint256 amount) external {
+        require(
+            lyricToken.transferFrom(msg.sender, address(this), amount),
+            "Transfer failed"
+        );
     }
 }
